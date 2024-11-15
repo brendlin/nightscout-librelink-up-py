@@ -8,6 +8,12 @@ from datetime import datetime,timedelta
 import pytz
 import os
 
+# For encoding and decoding
+import jwt
+import hashlib
+
+DEBUG = False
+
 # Defining some headers
 # -----------
 
@@ -22,12 +28,30 @@ def getNightscoutHeaders(settings) :
 def getLibreHeader(token=None) :
 
     header = {
-        'version': '4.2.1', # 4.2.1 ? 4.5.0 ? 4.2.2 ?
+        'version': '4.12.0', #'4.7.0', # 4.2.1 ? 4.5.0 ? 4.2.2 ?
         'product': 'llu.ios',
+        #
+        # Used for debugging, but none of it helped:
+        #
+        #'accept-encoding': 'gzip, deflate, br',
+        #'accept':'application/json',
+        #'cache-control': 'no-cache',
+        #'connection': 'Keep-Alive',
+        #'content-type': 'application/json',
+        #'user-agent':'kurt',
     }
 
     if token :
         header['authorization'] = 'Bearer '+token
+
+        # Need to include a hashed account-id in the header.
+        # See https://github.com/timoschlueter/nightscout-librelink-up/pull/170
+        #
+        decoded_token = jwt.decode(token,options={'verify_signature':False})
+        if DEBUG:
+            print('decoded token:',decoded_token)
+        hashed_id = hashlib.sha256(decoded_token['id'].encode()).hexdigest()
+        header['account-id'] = hashed_id
 
     return header
 
@@ -37,10 +61,13 @@ def getLibreHeader(token=None) :
 
 def check_or_renew_auth(current_authToken,current_expires,settings) :
 
+    TIME_FORMAT='%Y-%m-%d %H:%M:%S'
+
     # Get a new auth token if the old one expired.
     if datetime.now() > datetime.utcfromtimestamp(current_expires) :
 
-        #print('Creating new auth ticket')
+        if DEBUG :
+            print('Creating new auth ticket')
         api_endpoint = settings['api_endpoint']
         auth_url = 'https://api-{}.libreview.io/llu/auth/login'.format(api_endpoint)
         json_input = {'email':settings['libre_email'],
@@ -52,19 +79,22 @@ def check_or_renew_auth(current_authToken,current_expires,settings) :
                           allow_redirects=True)
     
         content = json.loads(r.content)
+        if DEBUG :
+            print(content)
         new_authToken = content['data']['authTicket']['token']
         new_expires = content['data']['authTicket']['expires']
 
-        #print('New auth ticket:',content['data']['authTicket'])
-        #print('Expires:',datetime.utcfromtimestamp(new_expires).strftime(TIME_FORMAT))
+        if DEBUG :
+            print('New auth ticket:',content['data']['authTicket'])
+            print('Expires:',datetime.utcfromtimestamp(new_expires).strftime(TIME_FORMAT))
         
         return new_authToken, new_expires
 
     # If the old auth token is still valid, keep it.
-    TIME_FORMAT='%Y-%m-%d %H:%M:%S'
-    #print('Reusing old auth ticket.')
-    #print('Time right now is:   {}'.format(datetime.now().strftime(TIME_FORMAT)))
-    #print('Auth ticket expires: {}'.format(datetime.utcfromtimestamp(current_expires).strftime(TIME_FORMAT)))
+    if DEBUG :
+        print('Reusing old auth ticket.')
+        print('Time right now is:   {}'.format(datetime.now().strftime(TIME_FORMAT)))
+        print('Auth ticket expires: {}'.format(datetime.utcfromtimestamp(current_expires).strftime(TIME_FORMAT)))
 
     return current_authToken, current_expires
 
@@ -86,7 +116,17 @@ def get_inst_value(token,settings) :
     url = 'https://api-{}.libreview.io/llu/connections'.format(settings['api_endpoint'])
     r = requests.get(url,headers=getLibreHeader(token))
     
-    glucoseMeasurement = json.loads(r.content)['data'][0]['glucoseMeasurement']
+    r_content = json.loads(r.content)
+    if DEBUG :
+        print('Status code:',r.status_code)
+        print('r_content:')
+        print(r_content)
+        print('r_content end.:')
+
+    if 'data' not in r_content.keys() :
+        raise RuntimeError('Something went wrong. Exiting.')
+
+    glucoseMeasurement = r_content['data'][0]['glucoseMeasurement']
     
     return glucoseMeasurement
 
@@ -117,17 +157,22 @@ def libre_trend_int_to_string(the_int) :
 def nightscout_last_entry_time_ms(settings) :
     url = '{}://{}/api/v1/entries?count=1'.format(settings['protocol'],settings['nightscout_url'])
     r = requests.get(url,headers=getNightscoutHeaders(settings),allow_redirects=True)
-    #print(r.text.split('\t'))
+    if not r.text :
+        return 0
+    if DEBUG :
+        print(r.text)
     return int(r.text.split('\t')[1])
 
 
 def upload_to_nightscout(ns_data_point,settings) :
     url = '{}://{}/api/v1/entries'.format(settings['protocol'],settings['nightscout_url'])
     r = requests.post(url, json=[ns_data_point],headers=getNightscoutHeaders(settings),allow_redirects=True)
+    if DEBUG :
+        print(r.text)
     return
 
 
-def delete_old_nightscout(settings,hours=2.0) :
+def delete_old_nightscout(settings,hours=6.0) :
     timestr = (datetime.now() - timedelta(hours=hours)).astimezone(pytz.utc).replace(tzinfo=None).isoformat(timespec='milliseconds')+'Z'
 
     url = '{}://{}/api/v1/entries?find[dateString][$lte]={}'
@@ -182,6 +227,8 @@ def main() :
     
     ns_lastentry_t = nightscout_last_entry_time_ms(user_settings)
 
+    if DEBUG :
+        print(entry_timestamp,ns_lastentry_t)
     if (entry_timestamp <= ns_lastentry_t) :
         # do not update!
         return
@@ -189,14 +236,17 @@ def main() :
     inst_ns = {'type':'sgv',
                'dateString':dt_utc.replace(tzinfo=None).isoformat(timespec='milliseconds')+'Z',
                'date':entry_timestamp,
-               'sgv':float(meas['ValueInMgPerDl']),
+               'sgv':int(meas['ValueInMgPerDl']),
+               'device':'timoschlueter',
                'direction':libre_trend_int_to_string(meas['TrendArrow'])
               }
 
-    #print(inst_ns)
+    if DEBUG:
+        print('Submitting:',inst_ns)
+
 
     upload_to_nightscout(inst_ns,user_settings)
-    delete_old_nightscout(user_settings)
+    #delete_old_nightscout(user_settings)
 
     return
 
